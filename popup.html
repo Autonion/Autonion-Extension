@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=400, initial-scale=1.0">
+  <title>Autonion</title>
+  <link rel="stylesheet" href="popup.css">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+</head>
+<body>
+  <!-- Header -->
+  <header class="header">
+    <div class="header-left">
+      <img src="icons/icon48.png" alt="Autonion" class="logo">
+      <div>
+        <h1 class="title">Autonion</h1>
+        <p class="subtitle">Cross-Device Automation</p>
+      </div>
+    </div>
+    <div class="connection-badge" id="connectionBadge">
+      <span class="status-dot" id="statusDot"></span>
+      <span id="statusText">Connecting...</span>
+    </div>
+  </header>
+
+  <!-- Settings Panel -->
+  <section class="panel">
+    <div class="panel-header">
+      <span class="panel-icon">⚙️</span>
+      <span class="panel-title">Settings</span>
+    </div>
+    <div class="form-group">
+      <label for="wsUrl">Desktop Agent URL</label>
+      <input type="text" id="wsUrl" placeholder="ws://localhost:4545/automation" spellcheck="false">
+    </div>
+    <div class="form-group">
+      <label for="aiPlatform">AI Platform</label>
+      <select id="aiPlatform">
+        <option value="chatgpt">ChatGPT</option>
+        <option value="gemini">Google Gemini</option>
+      </select>
+    </div>
+    <div class="button-row">
+      <button id="btnConnect" class="btn btn-primary">
+        <span class="btn-icon">🔌</span> Connect
+      </button>
+      <button id="btnDisconnect" class="btn btn-muted" disabled>
+        <span class="btn-icon">⛔</span> Disconnect
+      </button>
+      <button id="btnSaveSettings" class="btn btn-accent">
+        <span class="btn-icon">💾</span> Save
+      </button>
+    </div>
+  </section>
+
+  <!-- Manual Prompt -->
+  <section class="panel">
+    <div class="panel-header">
+      <span class="panel-icon">🧠</span>
+      <span class="panel-title">Manual Prompt</span>
+      <span class="panel-badge">Test Mode</span>
+    </div>
+    <div class="form-group">
+      <textarea id="promptInput" rows="3" placeholder="e.g. Open YouTube and search for relaxing music..."></textarea>
+    </div>
+    <div class="button-row">
+      <button id="btnExecute" class="btn btn-glow">
+        <span class="btn-icon">▶️</span> Execute
+      </button>
+      <button id="btnKillSwitch" class="btn btn-danger">
+        <span class="btn-icon">🛑</span> Kill Switch
+      </button>
+    </div>
+  </section>
+
+  <!-- Execution Status -->
+  <section class="panel" id="executionPanel" style="display:none;">
+    <div class="panel-header">
+      <span class="panel-icon">⚡</span>
+      <span class="panel-title">Execution</span>
+      <span class="panel-badge" id="execBadge">Idle</span>
+    </div>
+    <div class="progress-bar-container">
+      <div class="progress-bar" id="progressBar" style="width: 0%"></div>
+    </div>
+    <div class="step-info" id="stepInfo">Waiting for plan...</div>
+  </section>
+
+  <!-- Activity Log -->
+  <section class="panel panel-log">
+    <div class="panel-header">
+      <span class="panel-icon">📋</span>
+      <span class="panel-title">Activity Log</span>
+      <button id="btnClearLogs" class="btn-icon-only" title="Clear Logs">🗑️</button>
+    </div>
+    <div class="log-container" id="logContainer">
+      <div class="log-empty">No activity yet</div>
+    </div>
+  </section>
+
+  <script src="popup.js"></script>
+</body>
+</html>
