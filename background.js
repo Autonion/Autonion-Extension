@@ -15,13 +15,19 @@ let pingTimer = null;
 let currentExecution = null; // tracks running execution
 let killSwitchActive = false;
 
+// ── Trigger Rules State ──────────────────────────────────────
+let registeredRules = [];     // Rules from Android via Flutter
+// Map: ruleId -> { active: bool, lastTriggered: timestamp }
+let triggeredRulesState = {};
+const RULE_COOLDOWN_MS = 30000; // 30 seconds cooldown after leaving a matched site
+
 // Configurable desktop agent endpoint
 const DEFAULT_WS_URL = 'ws://localhost:4545/automation';
 
 // ── URL Category Map ─────────────────────────────────────────
 const URL_CATEGORIES = {
     meeting: [
-        'meet.google.com', 'zoom.us', 'teams.microsoft.com',
+        'meet.google.com', 'zoom.us', 'zoom.com', 'teams.microsoft.com',
         'teams.live.com', 'webex.com', 'gotomeeting.com',
         'whereby.com', 'discord.com',
     ],
@@ -177,6 +183,9 @@ function handleUrlChange(tabId, url) {
     sendToDesktop(trigger);
     broadcastToPopup({ type: 'url_trigger', ...trigger.payload });
     addLog(`URL trigger: ${new URL(url).hostname} → ${category}`);
+
+    // Check registered rules against this URL
+    checkRulesAgainstUrl(url, category);
 }
 
 // Listen for tab URL updates
@@ -194,6 +203,94 @@ chrome.tabs.onActivated.addListener(async (activeInfo) => {
     } catch (_) { }
 });
 
+
+// ══════════════════════════════════════════════════════════════
+// 2b. Trigger Rules — match URLs against Android-registered rules
+// ══════════════════════════════════════════════════════════════
+
+function handleRegisterTriggers(payload) {
+    const rules = payload.rules;
+    if (!Array.isArray(rules)) {
+        addLog('register_triggers: invalid or missing rules array');
+        return;
+    }
+
+    registeredRules = rules;
+    // Reset debounce state for new rule set
+    triggeredRulesState = {};
+    addLog(`Registered ${rules.length} trigger rule(s):`);
+    rules.forEach(r => {
+        addLog(`  Rule ${r.id}: ${r.criteria?.type} = ${r.criteria?.value}`);
+    });
+}
+
+/**
+ * Check all registered rules against the current URL.
+ * Smart debounce:
+ * - Don't re-trigger while user is still on a matching site (active = true)
+ * - Mark inactive when URL no longer matches
+ * - Only re-trigger if user returns after 30s cooldown
+ */
+function checkRulesAgainstUrl(url, category) {
+    if (registeredRules.length === 0) return;
+
+    const now = Date.now();
+    const matchedRuleIds = new Set();
+
+    for (const rule of registeredRules) {
+        const { id, criteria } = rule;
+        if (!id || !criteria) continue;
+
+        let matches = false;
+
+        if (criteria.type === 'category') {
+            matches = category === criteria.value;
+        } else if (criteria.type === 'url_contains') {
+            matches = url.toLowerCase().includes(criteria.value.toLowerCase());
+        }
+
+        if (matches) {
+            matchedRuleIds.add(id);
+            const state = triggeredRulesState[id];
+
+            if (!state) {
+                // First time match — trigger!
+                triggeredRulesState[id] = { active: true, lastTriggered: now };
+                fireRuleTrigger(id);
+            } else if (state.active) {
+                // Still on the same matching site — skip (don't re-trigger)
+            } else {
+                // Returning to the site — check cooldown
+                if (now - state.lastTriggered >= RULE_COOLDOWN_MS) {
+                    state.active = true;
+                    state.lastTriggered = now;
+                    fireRuleTrigger(id);
+                } else {
+                    // Within cooldown — skip
+                    addLog(`Rule ${id}: within cooldown, skipping`);
+                }
+            }
+        }
+    }
+
+    // Mark rules that are NO LONGER matching as inactive
+    for (const ruleId of Object.keys(triggeredRulesState)) {
+        if (!matchedRuleIds.has(ruleId) && triggeredRulesState[ruleId].active) {
+            triggeredRulesState[ruleId].active = false;
+            addLog(`Rule ${ruleId}: user left matching site, marked inactive`);
+        }
+    }
+}
+
+function fireRuleTrigger(ruleId) {
+    addLog(`Rule triggered: ${ruleId} — sending to desktop`);
+    sendToDesktop({
+        type: 'rule_triggered',
+        source: 'extension',
+        payload: { rule_id: ruleId },
+        timestamp: Date.now(),
+    });
+}
 
 // ══════════════════════════════════════════════════════════════
 // 3. Message Handlers — from Desktop Agent and Popup
@@ -215,6 +312,10 @@ function handleDesktopMessage(data) {
         case 'execute_prompt':
             // Android sent a natural language prompt to plan and execute
             handlePromptExecution(data.payload || data);
+            break;
+
+        case 'register_triggers':
+            handleRegisterTriggers(data.payload || data);
             break;
 
         case 'kill_switch':
