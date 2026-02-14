@@ -17,45 +17,212 @@ let killSwitchActive = false;
 
 // ── Trigger Rules State ──────────────────────────────────────
 let registeredRules = [];     // Rules from Android via Flutter
-// Map: ruleId -> { active: bool, lastTriggered: timestamp }
-let triggeredRulesState = {};
-const RULE_COOLDOWN_MS = 30000; // 30 seconds cooldown after leaving a matched site
+// Map: ruleId -> Set<tabId> — tracks which tabs currently match each rule
+let ruleMatchingTabs = {};
 
 // Configurable desktop agent endpoint
 const DEFAULT_WS_URL = 'ws://localhost:4545/automation';
 
-// ── URL Category Map ─────────────────────────────────────────
+// ── Tier 1: Known Domain Map ─────────────────────────────────
 const URL_CATEGORIES = {
     meeting: [
         'meet.google.com', 'zoom.us', 'zoom.com', 'teams.microsoft.com',
-        'teams.live.com', 'webex.com', 'gotomeeting.com',
-        'whereby.com', 'discord.com',
+        'teams.live.com', 'webex.com', 'gotomeeting.com', 'gotomeeting.com',
+        'whereby.com', 'bluejeans.com', 'join.me',
+        'meet.jit.si', 'around.co', 'gather.town', 'livestorm.co',
+        'cal.com', 'calendly.com', 'doodle.com',
     ],
     social: [
         'youtube.com', 'instagram.com', 'twitter.com', 'x.com',
         'facebook.com', 'reddit.com', 'tiktok.com', 'linkedin.com',
+        'pinterest.com', 'snapchat.com', 'tumblr.com', 'whatsapp.com',
+        'telegram.org', 'web.telegram.org', 'discord.com',
+        'twitch.tv', 'mastodon.social', 'threads.net',
     ],
-    productivity: [
-        'gmail.com', 'mail.google.com', 'drive.google.com',
-        'docs.google.com', 'sheets.google.com', 'slides.google.com',
-        'notion.so', 'trello.com', 'slack.com',
-    ],
-    ai: [
-        'chatgpt.com', 'chat.openai.com', 'gemini.google.com',
-        'claude.ai', 'copilot.microsoft.com', 'poe.com',
+    work: [
+        'github.com', 'gitlab.com', 'bitbucket.org',
+        'jira.atlassian.com', 'trello.com', 'asana.com', 'monday.com',
+        'notion.so', 'clickup.com', 'linear.app',
+        'slack.com', 'figma.com', 'miro.com',
+        'gmail.com', 'mail.google.com', 'outlook.live.com', 'outlook.office.com',
+        'drive.google.com', 'docs.google.com', 'sheets.google.com', 'slides.google.com',
+        'dropbox.com', 'box.com', 'onedrive.live.com',
+        'confluence.atlassian.com', 'basecamp.com',
     ],
 };
 
-function categorizeUrl(url) {
+// ── Tier 2: Keyword Heuristics ───────────────────────────────
+const KEYWORD_RULES = {
+    meeting: {
+        domain: ['meet', 'zoom', 'call', 'conference', 'webinar', 'video-call', 'huddle', 'standup'],
+        path: ['/meeting', '/join', '/room', '/call', '/webinar', '/session', '/invite'],
+    },
+    social: {
+        domain: ['social', 'chat', 'forum', 'feed', 'stream', 'photo', 'video', 'blog', 'vlog'],
+        path: ['/feed', '/post', '/story', '/reel', '/watch', '/shorts', '/live', '/channel'],
+    },
+    work: {
+        domain: ['jira', 'gitlab', 'github', 'bitbucket', 'slack', 'trello', 'asana', 'notion',
+            'figma', 'confluence', 'basecamp', 'clickup', 'linear', 'code', 'deploy',
+            'ci', 'pipeline', 'kanban', 'sprint', 'backlog', 'project', 'task', 'ticket'],
+        path: ['/repo', '/pull', '/issue', '/commit', '/merge', '/board', '/sprint', '/project',
+            '/task', '/wiki', '/docs', '/drive', '/file', '/inbox', '/compose', '/workspace'],
+    },
+};
+
+// ── Tier 3: AI Cache ─────────────────────────────────────────
+// Domains classified by AI are stored in chrome.storage.local
+// under 'domainCategoryCache' → { "example.com": "work", ... }
+const AI_CACHE_KEY = 'domainCategoryCache';
+let domainCacheLoaded = false;
+let domainCache = {}; // in-memory mirror of chrome.storage cache
+
+// Load cache on startup
+chrome.storage.local.get(AI_CACHE_KEY, (result) => {
+    domainCache = result[AI_CACHE_KEY] || {};
+    domainCacheLoaded = true;
+    console.log(`[Autonion] Loaded ${Object.keys(domainCache).length} cached domain classifications`);
+});
+
+/**
+ * 3-Tier URL Classification
+ * @param {string} url - Full URL
+ * @param {string} [pageTitle] - Optional page title for additional signals
+ * @returns {string} category: meeting | social | work | other
+ */
+function categorizeUrl(url, pageTitle) {
     try {
-        const hostname = new URL(url).hostname.replace(/^www\./, '');
+        const parsed = new URL(url);
+        const hostname = parsed.hostname.replace(/^www\./, '');
+        const path = parsed.pathname.toLowerCase();
+
+        // ── Tier 1: Known domain lookup ──
         for (const [category, domains] of Object.entries(URL_CATEGORIES)) {
             if (domains.some(d => hostname === d || hostname.endsWith('.' + d))) {
                 return category;
             }
         }
+
+        // ── Tier 2: Keyword heuristics ──
+        const domainLower = hostname.toLowerCase();
+        for (const [category, rules] of Object.entries(KEYWORD_RULES)) {
+            // Check domain name keywords
+            if (rules.domain.some(kw => domainLower.includes(kw))) {
+                return category;
+            }
+            // Check URL path keywords
+            if (rules.path.some(kw => path.includes(kw))) {
+                return category;
+            }
+        }
+
+        // Check page title keywords (if available)
+        if (pageTitle) {
+            const titleLower = pageTitle.toLowerCase();
+            const titleKeywords = {
+                meeting: ['meeting', 'call', 'conference', 'webinar', 'standup', 'huddle', 'join meeting'],
+                social: ['feed', 'timeline', 'home - ', 'watch', 'stream', 'photo', 'video'],
+                work: ['dashboard', 'project', 'task', 'inbox', 'pull request', 'issue', 'board', 'sprint',
+                    'document', 'spreadsheet', 'presentation', 'repository'],
+            };
+            for (const [category, keywords] of Object.entries(titleKeywords)) {
+                if (keywords.some(kw => titleLower.includes(kw))) {
+                    return category;
+                }
+            }
+        }
+
+        // ── Tier 3: AI cache lookup ──
+        if (domainCache[hostname]) {
+            return domainCache[hostname];
+        }
+
+        // Unknown domain — queue for AI classification (async, non-blocking)
+        queueForAIClassification(hostname);
+        return 'other';
+
     } catch (_) { }
     return 'other';
+}
+
+/**
+ * Queue a domain for AI classification.
+ * Uses the active chatbot to classify, then caches the result.
+ */
+const pendingClassifications = new Set();
+
+async function queueForAIClassification(hostname) {
+    if (pendingClassifications.has(hostname)) return;
+    pendingClassifications.add(hostname);
+
+    try {
+        const settings = await chrome.storage.local.get(['aiPlatform']);
+        const platform = settings.aiPlatform || 'chatgpt';
+        const chatbotPatterns = {
+            chatgpt: '*://chatgpt.com/*',
+            gemini: '*://gemini.google.com/*',
+        };
+
+        const tabs = await chrome.tabs.query({ url: chatbotPatterns[platform] });
+        if (tabs.length === 0) {
+            // No chatbot tab open — can't classify right now
+            pendingClassifications.delete(hostname);
+            return;
+        }
+
+        const tabId = tabs[0].id;
+        const prompt = `Classify this website domain into exactly one category. Reply with ONLY the category name, nothing else.\nCategories: meeting, social, work, other\nDomain: ${hostname}`;
+
+        const result = await chrome.scripting.executeScript({
+            target: { tabId },
+            func: (classifyPrompt) => {
+                const textarea = document.querySelector('textarea, [contenteditable="true"], div[role="textbox"]');
+                if (!textarea) return { error: 'No input found' };
+
+                const nativeSet = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value')?.set
+                    || Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
+                if (nativeSet) nativeSet.call(textarea, classifyPrompt);
+                else textarea.value = classifyPrompt;
+                textarea.dispatchEvent(new Event('input', { bubbles: true }));
+
+                setTimeout(() => {
+                    const btn = document.querySelector('button[data-testid="send-button"], button[aria-label="Send"]');
+                    if (btn) btn.click();
+                }, 300);
+
+                return { sent: true };
+            },
+            args: [prompt],
+        });
+
+        if (result[0]?.result?.sent) {
+            await new Promise(resolve => setTimeout(resolve, 8000));
+
+            const response = await chrome.scripting.executeScript({
+                target: { tabId },
+                func: () => {
+                    const msgs = document.querySelectorAll('[data-message-author-role="assistant"], .model-response-text, .response-content');
+                    if (msgs.length === 0) return null;
+                    return msgs[msgs.length - 1]?.textContent?.trim()?.toLowerCase();
+                },
+            });
+
+            const answer = response[0]?.result;
+            if (answer) {
+                const validCategories = ['meeting', 'social', 'work', 'other'];
+                const category = validCategories.find(c => answer.includes(c)) || 'other';
+                if (category !== 'other') {
+                    domainCache[hostname] = category;
+                    chrome.storage.local.set({ [AI_CACHE_KEY]: domainCache });
+                    addLog(`AI classified ${hostname} → ${category} (cached)`);
+                }
+            }
+        }
+    } catch (e) {
+        console.error(`[Autonion] AI classification failed for ${hostname}:`, e);
+    } finally {
+        pendingClassifications.delete(hostname);
+    }
 }
 
 
@@ -160,13 +327,22 @@ function sendToDesktop(message) {
 // 2. URL Monitor — watches tab changes for trigger categorization
 // ══════════════════════════════════════════════════════════════
 
-let lastReportedUrl = '';
+// Per-tab URL tracking (prevents duplicate events for same tab, but allows same URL in new tabs)
+const lastUrlByTab = {};
 
-function handleUrlChange(tabId, url) {
-    if (!url || url === lastReportedUrl || url.startsWith('chrome://') || url.startsWith('chrome-extension://')) return;
-    lastReportedUrl = url;
+async function handleUrlChange(tabId, url) {
+    if (!url || url.startsWith('chrome://') || url.startsWith('chrome-extension://')) return;
+    if (lastUrlByTab[tabId] === url) return; // Same URL in same tab — skip
+    lastUrlByTab[tabId] = url;
 
-    const category = categorizeUrl(url);
+    // Get page title for Tier 2 keyword analysis
+    let pageTitle = '';
+    try {
+        const tab = await chrome.tabs.get(tabId);
+        pageTitle = tab.title || '';
+    } catch (_) { }
+
+    const category = categorizeUrl(url, pageTitle);
     console.log(`[Autonion] URL change: ${url} → ${category}`);
 
     const trigger = {
@@ -185,7 +361,7 @@ function handleUrlChange(tabId, url) {
     addLog(`URL trigger: ${new URL(url).hostname} → ${category}`);
 
     // Check registered rules against this URL
-    checkRulesAgainstUrl(url, category);
+    checkRulesAgainstUrl(url, category, tabId);
 }
 
 // Listen for tab URL updates
@@ -216,8 +392,8 @@ function handleRegisterTriggers(payload) {
     }
 
     registeredRules = rules;
-    // Reset debounce state for new rule set
-    triggeredRulesState = {};
+    // Reset tab tracking for new rule set
+    ruleMatchingTabs = {};
     addLog(`Registered ${rules.length} trigger rule(s):`);
     rules.forEach(r => {
         addLog(`  Rule ${r.id}: ${r.criteria?.type} = ${r.criteria?.value}`);
@@ -225,17 +401,15 @@ function handleRegisterTriggers(payload) {
 }
 
 /**
- * Check all registered rules against the current URL.
- * Smart debounce:
- * - Don't re-trigger while user is still on a matching site (active = true)
- * - Mark inactive when URL no longer matches
- * - Only re-trigger if user returns after 30s cooldown
+ * Check registered rules against the current URL + tab.
+ * Tab-based debounce:
+ * - Track which tabs match each rule (ruleMatchingTabs: ruleId → Set<tabId>)
+ * - Trigger when a rule goes from 0 → 1 matching tabs
+ * - No re-trigger while ANY matching tab is open
+ * - Reset when ALL matching tabs are closed (via onRemoved listener)
  */
-function checkRulesAgainstUrl(url, category) {
+function checkRulesAgainstUrl(url, category, tabId) {
     if (registeredRules.length === 0) return;
-
-    const now = Date.now();
-    const matchedRuleIds = new Set();
 
     for (const rule of registeredRules) {
         const { id, criteria } = rule;
@@ -249,38 +423,56 @@ function checkRulesAgainstUrl(url, category) {
             matches = url.toLowerCase().includes(criteria.value.toLowerCase());
         }
 
-        if (matches) {
-            matchedRuleIds.add(id);
-            const state = triggeredRulesState[id];
+        const shortId = id.substring(0, 8);
 
-            if (!state) {
-                // First time match — trigger!
-                triggeredRulesState[id] = { active: true, lastTriggered: now };
+        if (!ruleMatchingTabs[id]) {
+            ruleMatchingTabs[id] = new Set();
+        }
+
+        if (matches) {
+            const wasEmpty = ruleMatchingTabs[id].size === 0;
+            ruleMatchingTabs[id].add(tabId);
+
+            if (wasEmpty) {
+                // 0 → 1 matching tabs: fire trigger!
+                addLog(`Rule ${shortId}: TRIGGERED (tab ${tabId}, 0→1 matching tabs)`);
                 fireRuleTrigger(id);
-            } else if (state.active) {
-                // Still on the same matching site — skip (don't re-trigger)
             } else {
-                // Returning to the site — check cooldown
-                if (now - state.lastTriggered >= RULE_COOLDOWN_MS) {
-                    state.active = true;
-                    state.lastTriggered = now;
-                    fireRuleTrigger(id);
-                } else {
-                    // Within cooldown — skip
-                    addLog(`Rule ${id}: within cooldown, skipping`);
-                }
+                addLog(`Rule ${shortId}: tab ${tabId} also matches (${ruleMatchingTabs[id].size} tabs open) → skip`);
+            }
+        } else {
+            // This tab no longer matches (e.g. navigated away within same tab)
+            if (ruleMatchingTabs[id].has(tabId)) {
+                ruleMatchingTabs[id].delete(tabId);
+                addLog(`Rule ${shortId}: tab ${tabId} navigated away (${ruleMatchingTabs[id].size} matching tabs left)`);
             }
         }
     }
+}
 
-    // Mark rules that are NO LONGER matching as inactive
-    for (const ruleId of Object.keys(triggeredRulesState)) {
-        if (!matchedRuleIds.has(ruleId) && triggeredRulesState[ruleId].active) {
-            triggeredRulesState[ruleId].active = false;
-            addLog(`Rule ${ruleId}: user left matching site, marked inactive`);
+/**
+ * When a tab is closed, remove it from all rule tracking.
+ * If a rule goes from 1 → 0 matching tabs, it resets (next match will trigger).
+ */
+function handleTabRemoved(tabId) {
+    for (const ruleId of Object.keys(ruleMatchingTabs)) {
+        if (ruleMatchingTabs[ruleId].has(tabId)) {
+            ruleMatchingTabs[ruleId].delete(tabId);
+            const shortId = ruleId.substring(0, 8);
+            const remaining = ruleMatchingTabs[ruleId].size;
+            addLog(`Rule ${shortId}: tab ${tabId} closed (${remaining} matching tabs left)`);
+            if (remaining === 0) {
+                addLog(`Rule ${shortId}: all matching tabs closed — RESET (next visit will trigger)`);
+            }
         }
     }
 }
+
+// Listen for tab closures to reset rules and clean up URL tracking
+chrome.tabs.onRemoved.addListener((tabId) => {
+    delete lastUrlByTab[tabId]; // Clean up per-tab URL tracking
+    handleTabRemoved(tabId);
+});
 
 function fireRuleTrigger(ruleId) {
     addLog(`Rule triggered: ${ruleId} — sending to desktop`);
