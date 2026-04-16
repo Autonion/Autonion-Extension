@@ -252,6 +252,8 @@ async function connectWebSocket() {
             broadcastToPopup({ type: 'status', status: 'connected', url });
             addLog('Connected to Desktop Agent');
             startPingLoop();
+            // Keep service worker alive while connected (MV3 workaround)
+            chrome.alarms.create('keepalive', { periodInMinutes: 0.4 });
         };
 
         ws.onmessage = (event) => {
@@ -267,6 +269,7 @@ async function connectWebSocket() {
             wsConnected = false;
             ws = null;
             stopPingLoop();
+            chrome.alarms.clear('keepalive');
             console.log('[Autonion] Disconnected');
             broadcastToPopup({ type: 'status', status: 'disconnected' });
             addLog('Disconnected from Desktop Agent');
@@ -506,6 +509,21 @@ function handleDesktopMessage(data) {
             handlePromptExecution(data.payload || data);
             break;
 
+        case 'execute_browser_plan':
+            // Desktop agent generated the plan locally and sent it over
+            handleDirectBrowserPlanExecution(data);
+            break;
+
+        case 'capture_dom':
+            // Agent requests a DOM snapshot of the active tab
+            handleCaptureDom(data.payload || data);
+            break;
+
+        case 'execute_single_step':
+            // Agent sends one step at a time (agentic loop)
+            handleExecuteSingleStep(data.payload || data);
+            break;
+
         case 'register_triggers':
             handleRegisterTriggers(data.payload || data);
             break;
@@ -516,6 +534,280 @@ function handleDesktopMessage(data) {
 
         default:
             addLog(`Unknown desktop message type: ${type}`);
+    }
+}
+
+// ── DOM Snapshot Capture for Agentic Loop ─────────────────
+
+/**
+ * Injected into a page to produce a compact, LLM-friendly DOM snapshot.
+ * Returns only interactive/visible elements with generated IDs.
+ */
+function captureDOMSnapshotInjected() {
+    const INTERACTIVE = 'a, button, input, textarea, select, [role="button"], [role="link"], [role="tab"], [role="menuitem"], [role="option"], [role="searchbox"], [role="textbox"], [role="checkbox"], [role="radio"], video, [contenteditable="true"], [tabindex]';
+    const elements = [];
+    let idCounter = 0;
+
+    document.querySelectorAll(INTERACTIVE).forEach(el => {
+        // Skip hidden/invisible elements
+        if (el.offsetParent === null && el.tagName !== 'INPUT' && el.getAttribute('type') !== 'hidden') return;
+        if (el.offsetWidth === 0 && el.offsetHeight === 0) return;
+
+        const id = `el_${idCounter++}`;
+        el.setAttribute('data-autonion-id', id);
+
+        const text = (el.textContent || '').trim().substring(0, 80);
+        const entry = { id, tag: el.tagName.toLowerCase() };
+
+        if (text) entry.text = text;
+        if (el.getAttribute('aria-label')) entry.ariaLabel = el.getAttribute('aria-label');
+        if (el.getAttribute('placeholder')) entry.placeholder = el.getAttribute('placeholder');
+        if (el.getAttribute('role')) entry.role = el.getAttribute('role');
+        if (el.getAttribute('href')) entry.href = el.getAttribute('href').substring(0, 120);
+        if (el.getAttribute('type')) entry.inputType = el.getAttribute('type');
+        if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') entry.value = (el.value || '').substring(0, 60);
+
+        elements.push(entry);
+    });
+
+    return {
+        url: window.location.href,
+        title: document.title,
+        elementCount: elements.length,
+        elements: elements.slice(0, 100), // Cap at 100 elements to avoid prompt overflow
+    };
+}
+
+async function handleCaptureDom(payload) {
+    const transactionId = payload.transaction_id || payload.transactionId || '';
+    try {
+        let tabId = null;
+        const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+        if (activeTab) tabId = activeTab.id;
+
+        if (!tabId) {
+            sendToDesktop({
+                type: 'dom_snapshot',
+                source: 'extension',
+                transaction_id: transactionId,
+                status: 'error',
+                message: 'No active tab found',
+            });
+            return;
+        }
+
+        const result = await chrome.scripting.executeScript({
+            target: { tabId },
+            func: captureDOMSnapshotInjected,
+        });
+
+        const snapshot = result[0]?.result;
+        if (!snapshot) throw new Error('DOM capture returned null');
+
+        addLog(`[DOM] Captured ${snapshot.elementCount} elements from ${snapshot.url}`);
+        sendToDesktop({
+            type: 'dom_snapshot',
+            source: 'extension',
+            transaction_id: transactionId,
+            status: 'success',
+            snapshot,
+        });
+    } catch (e) {
+        addLog(`[DOM] Capture failed: ${e.message}`);
+        sendToDesktop({
+            type: 'dom_snapshot',
+            source: 'extension',
+            transaction_id: transactionId,
+            status: 'error',
+            message: e.message,
+        });
+    }
+}
+
+async function handleExecuteSingleStep(payload) {
+    const transactionId = payload.transaction_id || payload.transactionId || '';
+    const step = payload.step;
+    const stepIndex = payload.step_index || 0;
+
+    // Keep service worker alive during agentic loop
+    chrome.alarms.create('keepalive', { periodInMinutes: 0.4 });
+
+    if (!step || !step.action) {
+        sendToDesktop({
+            type: 'step_result',
+            source: 'extension',
+            transaction_id: transactionId,
+            status: 'error',
+            message: 'Invalid step: missing action',
+        });
+        return;
+    }
+
+    addLog(`[Agentic] Executing step ${stepIndex}: ${step.action}`);
+    sendToDesktop({
+        type: 'execution_status',
+        source: 'extension',
+        transaction_id: transactionId,
+        status: 'step',
+        step: stepIndex + 1,
+        action: step.action,
+        message: `Executing: ${step.action}`,
+    });
+
+    let activeTabId = null;
+    try {
+        const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+        if (activeTab) activeTabId = activeTab.id;
+    } catch (_) {}
+
+    try {
+        switch (step.action) {
+            case 'open_url': {
+                const url = step.params?.url;
+                if (!url) throw new Error('Missing url param');
+                const tab = await chrome.tabs.create({ url, active: true });
+                activeTabId = tab.id;
+                await waitForTabLoad(activeTabId, 15000);
+                await sleep(3000); // Extra time for YouTube/heavy pages to fully render
+                break;
+            }
+            case 'click_element': {
+                if (!activeTabId) throw new Error('No active tab');
+                // Prefer target_id (data-autonion-id) for precise targeting
+                const targetId = step.params?.target_id;
+                if (targetId) {
+                    const result = await chrome.scripting.executeScript({
+                        target: { tabId: activeTabId },
+                        func: (tid) => {
+                            const el = document.querySelector(`[data-autonion-id="${tid}"]`);
+                            if (!el) return { error: `Element with id "${tid}" not found` };
+                            el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                            el.click();
+                            return { success: true, text: (el.textContent || '').trim().substring(0, 50) };
+                        },
+                        args: [targetId],
+                    });
+                    if (result[0]?.result?.error) throw new Error(result[0].result.error);
+                } else {
+                    // Fallback to text-based clicking
+                    const clickIndex = step.params?.index ?? 0;
+                    const result = await chrome.scripting.executeScript({
+                        target: { tabId: activeTabId },
+                        func: executeDOMClick,
+                        args: [step.params.target, step.params.type || 'text', clickIndex],
+                    });
+                    if (result[0]?.result?.error) throw new Error(result[0].result.error);
+                }
+                await sleep(2000);
+                break;
+            }
+            case 'type_into': {
+                if (!activeTabId) throw new Error('No active tab');
+                const targetId = step.params?.target_id;
+                if (targetId) {
+                    const result = await chrome.scripting.executeScript({
+                        target: { tabId: activeTabId },
+                        func: (tid, text, pressEnter) => {
+                            const el = document.querySelector(`[data-autonion-id="${tid}"]`);
+                            if (!el) return { error: `Element with id "${tid}" not found` };
+                            el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                            el.focus();
+                            const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set
+                                || Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value')?.set;
+                            if (nativeSetter) nativeSetter.call(el, text);
+                            else el.value = text;
+                            el.dispatchEvent(new Event('input', { bubbles: true }));
+                            el.dispatchEvent(new Event('change', { bubbles: true }));
+                            if (pressEnter) {
+                                el.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, bubbles: true }));
+                                el.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, bubbles: true }));
+                            }
+                            return { success: true, enterPressed: !!pressEnter };
+                        },
+                        args: [targetId, step.params.text, !!step.params.pressEnter],
+                    });
+                    if (result[0]?.result?.error) throw new Error(result[0].result.error);
+                } else {
+                    const shouldEnter = !!step.params.pressEnter;
+                    const result = await chrome.scripting.executeScript({
+                        target: { tabId: activeTabId },
+                        func: executeDOMType,
+                        args: [step.params.target, step.params.text, step.params.type || 'label', shouldEnter],
+                    });
+                    if (result[0]?.result?.error) throw new Error(result[0].result.error);
+                }
+                await sleep(step.params?.pressEnter ? 2500 : 800);
+                break;
+            }
+            case 'press_key': {
+                if (!activeTabId) throw new Error('No active tab');
+                const key = step.params?.key || 'Enter';
+                await chrome.scripting.executeScript({
+                    target: { tabId: activeTabId },
+                    func: executeDOMPressKey,
+                    args: [key, step.params?.target || null, step.params?.type || 'label'],
+                });
+                await sleep(1500);
+                break;
+            }
+            case 'wait': {
+                const ms = step.params?.ms || 1000;
+                await sleep(Math.min(ms, 10000));
+                break;
+            }
+            case 'scroll_to': {
+                if (!activeTabId) throw new Error('No active tab');
+                await chrome.scripting.executeScript({
+                    target: { tabId: activeTabId },
+                    func: executeDOMScroll,
+                    args: [step.params.target, step.params.type || 'text'],
+                });
+                await sleep(500);
+                break;
+            }
+            default:
+                addLog(`[Agentic] Unknown action: ${step.action}`);
+        }
+
+        // Capture fresh DOM after step execution
+        let snapshot = null;
+        try {
+            // Re-query active tab (might have changed after navigation)
+            const [currentTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+            if (currentTab) activeTabId = currentTab.id;
+
+            if (activeTabId) {
+                const domResult = await chrome.scripting.executeScript({
+                    target: { tabId: activeTabId },
+                    func: captureDOMSnapshotInjected,
+                });
+                snapshot = domResult[0]?.result || null;
+            }
+        } catch (domErr) {
+            addLog(`[Agentic] DOM re-capture failed: ${domErr.message}`);
+        }
+
+        sendToDesktop({
+            type: 'step_result',
+            source: 'extension',
+            transaction_id: transactionId,
+            status: 'success',
+            step_index: stepIndex,
+            action: step.action,
+            snapshot,
+        });
+
+    } catch (e) {
+        addLog(`[Agentic] Step ${stepIndex} failed: ${e.message}`);
+        sendToDesktop({
+            type: 'step_result',
+            source: 'extension',
+            transaction_id: transactionId,
+            status: 'error',
+            step_index: stepIndex,
+            action: step.action,
+            message: e.message,
+        });
     }
 }
 
@@ -632,6 +924,43 @@ async function handlePromptExecution(payload) {
             message: `Failed to inject prompt into ${platform}: ${e.message}`,
         });
     }
+}
+
+async function handleDirectBrowserPlanExecution(data) {
+    if (killSwitchActive) {
+        addLog('BLOCKED: Kill switch is active. Reset before executing.');
+        return;
+    }
+
+    const payload = data.payload || data;
+    const transactionId = payload.transaction_id || payload.transactionId || data.transaction_id || data.transactionId || crypto.randomUUID();
+    const steps = payload.steps || data.steps;
+
+    addLog(`[DirectPlan] Received data keys: ${Object.keys(data).join(', ')}${data.payload ? ', payload keys: ' + Object.keys(data.payload).join(', ') : ''}`);
+    addLog(`[DirectPlan] Steps type: ${typeof steps}, isArray: ${Array.isArray(steps)}, length: ${Array.isArray(steps) ? steps.length : 'N/A'}`);
+
+    if (!Array.isArray(steps) || steps.length === 0) {
+        addLog(`[DirectPlan] REJECTED - full data: ${JSON.stringify(data).substring(0, 500)}`);
+        sendToDesktop({
+            type: 'execution_status',
+            source: 'extension',
+            transaction_id: transactionId,
+            status: 'error',
+            message: 'Invalid plan received from Desktop Agent',
+        });
+        return;
+    }
+
+    addLog(`Executing ${steps.length} direct browser actions from Agent...`);
+    sendToDesktop({
+        type: 'execution_status',
+        source: 'extension',
+        transaction_id: transactionId,
+        status: 'executing',
+        message: `Executing ${steps.length} browser actions...`,
+    });
+    
+    await executeBrowserPlan(transactionId, steps);
 }
 
 function buildAugmentedPrompt(userPrompt) {
@@ -1658,6 +1987,13 @@ function broadcastToPopup(message) {
 chrome.alarms.onAlarm.addListener((alarm) => {
     if (alarm.name === 'reconnect') {
         connectWebSocket();
+    } else if (alarm.name === 'keepalive') {
+        // Just touching the service worker keeps it alive
+        console.log('[Autonion] Keepalive tick');
+        // Re-establish WS if it died
+        if (!ws || ws.readyState !== WebSocket.OPEN) {
+            connectWebSocket();
+        }
     }
 });
 
