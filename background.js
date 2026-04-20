@@ -765,6 +765,159 @@ async function handleExecuteSingleStep(payload) {
                 await sleep(500);
                 break;
             }
+            case 'play_media': {
+                if (!activeTabId) throw new Error('No active tab');
+                addLog('[play_media/agentic] Starting media playback...');
+                await sleep(3000); // Wait for video to load
+
+                // Step 1: Get play button coordinates
+                const coordResult = await chrome.scripting.executeScript({
+                    target: { tabId: activeTabId },
+                    func: () => {
+                        const logs = [];
+                        logs.push(`URL: ${window.location.href}`);
+                        
+                        const video = document.querySelector('video');
+                        logs.push(`Video found: ${!!video}`);
+                        if (video) {
+                            logs.push(`State: paused=${video.paused}, time=${video.currentTime}, ready=${video.readyState}`);
+                            if (!video.paused && video.currentTime > 0) {
+                                logs.push('Already playing — no click needed');
+                                return { alreadyPlaying: true, logs };
+                            }
+                        }
+                        
+                        // Find the YouTube play button or video player center
+                        const ytBtn = document.querySelector('.ytp-play-button');
+                        if (ytBtn) {
+                            const rect = ytBtn.getBoundingClientRect();
+                            const x = rect.left + rect.width / 2;
+                            const y = rect.top + rect.height / 2;
+                            logs.push(`Play button at (${x}, ${y}), size=${rect.width}x${rect.height}`);
+                            return { x, y, target: 'ytp-play-button', logs };
+                        }
+                        
+                        // Fallback: click center of video element
+                        if (video) {
+                            const rect = video.getBoundingClientRect();
+                            const x = rect.left + rect.width / 2;
+                            const y = rect.top + rect.height / 2;
+                            logs.push(`No play button found — using video center at (${x}, ${y})`);
+                            return { x, y, target: 'video-center', logs };
+                        }
+                        
+                        logs.push('No video or play button found');
+                        return { x: null, y: null, logs };
+                    },
+                });
+                
+                const coords = coordResult[0]?.result;
+                if (coords?.logs) coords.logs.forEach(l => addLog(`[play_media] ${l}`));
+                
+                if (coords?.alreadyPlaying) {
+                    addLog('[play_media] Video already playing — done');
+                    break;
+                }
+                
+                if (coords?.x != null && coords?.y != null) {
+                    // Step 2: Use chrome.debugger for trusted click
+                    try {
+                        addLog(`[play_media] Sending trusted click at (${coords.x}, ${coords.y}) via debugger`);
+                        const debugTarget = { tabId: activeTabId };
+                        await chrome.debugger.attach(debugTarget, '1.3');
+                        
+                        await chrome.debugger.sendCommand(debugTarget, 'Input.dispatchMouseEvent', {
+                            type: 'mousePressed',
+                            x: Math.round(coords.x),
+                            y: Math.round(coords.y),
+                            button: 'left',
+                            clickCount: 1,
+                        });
+                        await sleep(50);
+                        await chrome.debugger.sendCommand(debugTarget, 'Input.dispatchMouseEvent', {
+                            type: 'mouseReleased',
+                            x: Math.round(coords.x),
+                            y: Math.round(coords.y),
+                            button: 'left',
+                            clickCount: 1,
+                        });
+                        
+                        await chrome.debugger.detach(debugTarget);
+                        addLog('[play_media] Trusted click sent successfully');
+                    } catch (dbgErr) {
+                        addLog(`[play_media] Debugger click failed: ${dbgErr.message}, trying content script fallback`);
+                        // Fallback: content script click
+                        await chrome.scripting.executeScript({
+                            target: { tabId: activeTabId },
+                            func: () => {
+                                const ytBtn = document.querySelector('.ytp-play-button');
+                                if (ytBtn) ytBtn.click();
+                                const video = document.querySelector('video');
+                                if (video) video.play().catch(() => {});
+                            },
+                        });
+                    }
+                }
+                
+                // Step 3: Verify playback
+                await sleep(2000);
+                const verifyResult = await chrome.scripting.executeScript({
+                    target: { tabId: activeTabId },
+                    func: () => {
+                        const v = document.querySelector('video');
+                        return { 
+                            playing: v ? !v.paused : false, 
+                            currentTime: v?.currentTime || 0,
+                            paused: v?.paused 
+                        };
+                    },
+                });
+                const vr = verifyResult[0]?.result;
+                addLog(`[play_media] Verification: playing=${vr?.playing}, time=${vr?.currentTime}`);
+                
+                // If still not playing, try one more debugger click
+                if (vr?.paused) {
+                    addLog('[play_media] Still paused — retrying debugger click on video center');
+                    try {
+                        const centerResult = await chrome.scripting.executeScript({
+                            target: { tabId: activeTabId },
+                            func: () => {
+                                const v = document.querySelector('video');
+                                if (!v) return null;
+                                const r = v.getBoundingClientRect();
+                                return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+                            },
+                        });
+                        const vc = centerResult[0]?.result;
+                        if (vc) {
+                            const dt = { tabId: activeTabId };
+                            await chrome.debugger.attach(dt, '1.3');
+                            await chrome.debugger.sendCommand(dt, 'Input.dispatchMouseEvent', {
+                                type: 'mousePressed', x: Math.round(vc.x), y: Math.round(vc.y), button: 'left', clickCount: 1,
+                            });
+                            await sleep(50);
+                            await chrome.debugger.sendCommand(dt, 'Input.dispatchMouseEvent', {
+                                type: 'mouseReleased', x: Math.round(vc.x), y: Math.round(vc.y), button: 'left', clickCount: 1,
+                            });
+                            await chrome.debugger.detach(dt);
+                            addLog('[play_media] Retry click sent');
+                        }
+                    } catch (_) {}
+                    
+                    await sleep(2000);
+                    const finalCheck = await chrome.scripting.executeScript({
+                        target: { tabId: activeTabId },
+                        func: () => {
+                            const v = document.querySelector('video');
+                            return { playing: v ? !v.paused : false, time: v?.currentTime || 0 };
+                        },
+                    });
+                    const fc = finalCheck[0]?.result;
+                    addLog(`[play_media] Final check: playing=${fc?.playing}, time=${fc?.time}`);
+                }
+                
+                break;
+            }
             default:
                 addLog(`[Agentic] Unknown action: ${step.action}`);
         }
@@ -870,6 +1023,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 const processedTxIds = new Set();
 
 async function handlePromptExecution(payload) {
+    killSwitchActive = false; // Reset on new execution
     if (killSwitchActive) {
         addLog('BLOCKED: Kill switch is active. Reset before executing.');
         return;
@@ -927,6 +1081,7 @@ async function handlePromptExecution(payload) {
 }
 
 async function handleDirectBrowserPlanExecution(data) {
+    killSwitchActive = false; // Reset on new execution
     if (killSwitchActive) {
         addLog('BLOCKED: Kill switch is active. Reset before executing.');
         return;
@@ -989,6 +1144,7 @@ Available actions:
 - "scroll_to" with params: { "target": "element text", "type": "text" }
 - "select_option" with params: { "target": "dropdown label or visible text", "value": "option text to select" }
   - Works for both native <select> elements AND custom dropdowns (clicks trigger, then clicks option)
+- "play_media" with params: {} — clicks the video/audio play button and ensures playback starts. MUST be used after navigating to a video/music page.
 
 RULES:
 - Maximum 10 steps
@@ -1001,6 +1157,10 @@ RULES:
 - For sorting/filtering dropdowns, use select_option — it handles both native and custom dropdowns
 - When clicking search results or listed items (e.g. videos, products, links), prefer "type": "text" and set "target" to a partial text you expect in the item title. For YouTube videos after a search, use "type": "label" with "target" set to the search term, or use "type": "selector" with "target": "#video-title" and "index": 0
 - NEVER use vague targets like "video title" or "result" — always use something that matches real visible text, aria-label, or a known CSS selector
+- MEDIA PLAYBACK: When the user's prompt involves playing a video, song, or any media content:
+  1. Navigate to the site (e.g. YouTube), search for the content, and click the correct result.
+  2. After clicking a video/song result and landing on the watch/player page, ALWAYS add a "play_media" step.
+  3. Do NOT skip the play_media step — without it the video will not actually start playing.
 - Output ONLY the JSON, nothing else`;
 }
 
@@ -1145,7 +1305,7 @@ async function handleChatbotResponse(responseText, transactionId) {
     broadcastToPopup({ type: 'plan_validated', plan: safetyResult.plan });
 
     // Separate browser vs desktop actions
-    const browserActions = ['open_url', 'click_element', 'type_into', 'press_key', 'wait', 'scroll_to', 'select_option', 'read_text', 'go_back', 'go_forward', 'refresh', 'close_tab'];
+    const browserActions = ['open_url', 'click_element', 'type_into', 'press_key', 'wait', 'scroll_to', 'select_option', 'read_text', 'go_back', 'go_forward', 'refresh', 'close_tab', 'play_media'];
     const browserSteps = safetyResult.plan.steps.filter(s => browserActions.includes(s.action));
     const desktopSteps = safetyResult.plan.steps.filter(s => !browserActions.includes(s.action));
 
@@ -1418,6 +1578,133 @@ async function executeBrowserPlan(transactionId, steps) {
                         const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
                         if (activeTab) activeTabId = activeTab.id;
                     } catch (_) { }
+                    break;
+                }
+
+                case 'play_media': {
+                    if (!activeTabId) activeTabId = await getActiveTabId();
+                    addLog('[play_media] Starting media playback sequence...');
+                    await sleep(3000);
+                    
+                    // Step 1: Get play button coordinates
+                    const playCoordResult = await chrome.scripting.executeScript({
+                        target: { tabId: activeTabId },
+                        func: () => {
+                            const logs = [];
+                            logs.push(`URL: ${window.location.href}`);
+                            logs.push(`Title: ${document.title}`);
+                            const video = document.querySelector('video');
+                            logs.push(`Video found: ${!!video}`);
+                            if (video) {
+                                logs.push(`State: paused=${video.paused}, time=${video.currentTime}, ready=${video.readyState}`);
+                                if (!video.paused && video.currentTime > 0) {
+                                    return { alreadyPlaying: true, logs };
+                                }
+                            }
+                            const ytBtn = document.querySelector('.ytp-play-button');
+                            if (ytBtn) {
+                                const rect = ytBtn.getBoundingClientRect();
+                                const x = rect.left + rect.width / 2;
+                                const y = rect.top + rect.height / 2;
+                                logs.push(`Play button at (${x}, ${y})`);
+                                return { x, y, target: 'ytp-play-button', logs };
+                            }
+                            if (video) {
+                                const rect = video.getBoundingClientRect();
+                                const x = rect.left + rect.width / 2;
+                                const y = rect.top + rect.height / 2;
+                                logs.push(`Using video center at (${x}, ${y})`);
+                                return { x, y, target: 'video-center', logs };
+                            }
+                            logs.push('No video or play button found');
+                            return { x: null, y: null, logs };
+                        },
+                    });
+                    
+                    const playCoords = playCoordResult[0]?.result;
+                    if (playCoords?.logs) playCoords.logs.forEach(l => addLog(`[play_media] ${l}`));
+                    
+                    if (playCoords?.alreadyPlaying) {
+                        addLog('[play_media] Already playing — done');
+                        break;
+                    }
+                    
+                    if (playCoords?.x != null && playCoords?.y != null) {
+                        try {
+                            addLog(`[play_media] Sending trusted click at (${playCoords.x}, ${playCoords.y})`);
+                            const dbgTarget = { tabId: activeTabId };
+                            await chrome.debugger.attach(dbgTarget, '1.3');
+                            await chrome.debugger.sendCommand(dbgTarget, 'Input.dispatchMouseEvent', {
+                                type: 'mousePressed', x: Math.round(playCoords.x), y: Math.round(playCoords.y), button: 'left', clickCount: 1,
+                            });
+                            await sleep(50);
+                            await chrome.debugger.sendCommand(dbgTarget, 'Input.dispatchMouseEvent', {
+                                type: 'mouseReleased', x: Math.round(playCoords.x), y: Math.round(playCoords.y), button: 'left', clickCount: 1,
+                            });
+                            await chrome.debugger.detach(dbgTarget);
+                            addLog('[play_media] Trusted click sent');
+                        } catch (dbgErr) {
+                            addLog(`[play_media] Debugger failed: ${dbgErr.message}, trying fallback`);
+                            await chrome.scripting.executeScript({
+                                target: { tabId: activeTabId },
+                                func: () => {
+                                    const b = document.querySelector('.ytp-play-button');
+                                    if (b) b.click();
+                                    const v = document.querySelector('video');
+                                    if (v) v.play().catch(() => {});
+                                },
+                            });
+                        }
+                    }
+                    
+                    // Verify
+                    await sleep(2000);
+                    const playVerify = await chrome.scripting.executeScript({
+                        target: { tabId: activeTabId },
+                        func: () => {
+                            const v = document.querySelector('video');
+                            return { playing: v ? !v.paused : false, time: v?.currentTime || 0 };
+                        },
+                    });
+                    const pvr = playVerify[0]?.result;
+                    addLog(`[play_media] Result: playing=${pvr?.playing}, time=${pvr?.time}`);
+                    
+                    if (!pvr?.playing) {
+                        addLog('[play_media] Retrying with video center click...');
+                        try {
+                            const vcr = await chrome.scripting.executeScript({
+                                target: { tabId: activeTabId },
+                                func: () => {
+                                    const v = document.querySelector('video');
+                                    if (!v) return null;
+                                    const r = v.getBoundingClientRect();
+                                    return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+                                },
+                            });
+                            const vc = vcr[0]?.result;
+                            if (vc) {
+                                const dt = { tabId: activeTabId };
+                                await chrome.debugger.attach(dt, '1.3');
+                                await chrome.debugger.sendCommand(dt, 'Input.dispatchMouseEvent', {
+                                    type: 'mousePressed', x: Math.round(vc.x), y: Math.round(vc.y), button: 'left', clickCount: 1,
+                                });
+                                await sleep(50);
+                                await chrome.debugger.sendCommand(dt, 'Input.dispatchMouseEvent', {
+                                    type: 'mouseReleased', x: Math.round(vc.x), y: Math.round(vc.y), button: 'left', clickCount: 1,
+                                });
+                                await chrome.debugger.detach(dt);
+                            }
+                        } catch (_) {}
+                        await sleep(1500);
+                        const fc2 = await chrome.scripting.executeScript({
+                            target: { tabId: activeTabId },
+                            func: () => {
+                                const v = document.querySelector('video');
+                                return { playing: v ? !v.paused : false, time: v?.currentTime || 0 };
+                            },
+                        });
+                        addLog(`[play_media] Final: playing=${fc2[0]?.result?.playing}, time=${fc2[0]?.result?.time}`);
+                    }
                     break;
                 }
 

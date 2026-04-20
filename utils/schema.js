@@ -26,6 +26,7 @@ const ALLOWED_ACTIONS = [
   'go_forward',
   'refresh',
   'close_tab',
+  'play_media',
 ];
 
 const DESTRUCTIVE_KEYWORDS = [
